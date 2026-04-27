@@ -1,0 +1,34 @@
+[package]
+name = "qq-bot-rs"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Async Rust SDK for the Tencent QQ Bot v2 platform — HTTP + gateway + typed events."
+repository = "https://github.com/yenharvey/qq-bot-rs"
+homepage = "https://github.com/yenharvey/qq-bot-rs"
+documentation = "https://docs.rs/qq-bot-rs"
+readme = "README.md"
+keywords = ["qq", "bot", "qqbot", "tencent", "async"]
+categories = ["api-bindings", "asynchronous"]
+
+[dependencies]
+async-trait = "0.1.89"
+base64 = "0.22.1"
+bitflags = { version = "2.11.1", features = ["serde"] }
+futures-util = "0.3.32"
+reqwest = { version = "0.13.2", default-features = false, features = ["json", "rustls", "http2"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+serde_repr = "0.1.20"
+thiserror = "2.0.18"
+tokio = { version = "1.52.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-webpki-roots"] }
+tracing = "0.1.44"
+url = { version = "2.5.8", features = ["serde"] }
+
+[dev-dependencies]
+cargo-husky = { version = "1.5.0", default-features = false, features = ["user-hooks"] }
+dotenvy = "0.15.7"
+tokio-test = "0.4.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+wiremock = "0.6.5"

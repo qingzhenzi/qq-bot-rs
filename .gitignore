@@ -1,0 +1,16 @@
+/target
+
+.env
+.env.local
+.env.*.local
+
+.history
+.vscode
+.idea
+
+.serena
+
+.DS_Store
+
+CLAUDE.md
+.claude
