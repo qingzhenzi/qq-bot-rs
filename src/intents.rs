@@ -67,6 +67,12 @@ impl Intents {
             | Self::AUDIO_ACTION
             | Self::PUBLIC_GUILD_MESSAGES
     }
+
+    /// 仅群聊 + 私聊——不订阅任何频道 / 公会事件。网关不会推送 `OPEN_FORUM_*`、
+    /// `GUILD_*`、`CHANNEL_*` 等事件，日志干净。
+    pub fn group_and_c2c_only() -> Self {
+        Self::PUBLIC_MESSAGES | Self::INTERACTION
+    }
 }
 
 impl Serialize for Intents {

@@ -9,7 +9,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::auth::Credentials;
 use crate::error::HttpError;
-use crate::http::{Bot, EmojiType, InteractionCallbackCode};
+use crate::http::{Bot, ChannelPermissions, EmojiType, InteractionCallbackCode};
 use crate::types::message::OutgoingChannelMessage;
 use crate::types::payloads::FileType;
 
@@ -573,4 +573,915 @@ async fn api_error_display_includes_trace_id() {
     let s = err.to_string();
     assert!(s.contains("11253"), "code in display: {s}");
     assert!(s.contains("trace_id=trace-xyz"), "trace_id in display: {s}");
+}
+
+// ─── Guilds / Channels API tests ───
+
+/// **get_guild**：`GET /guilds/{guild_id}` 解析出 Guild。
+#[tokio::test]
+async fn get_guild_parses_response() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/guilds/G-001"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "G-001",
+            "name": "My Guild",
+            "owner_id": "U-OWNER",
+            "member_count": 42,
+            "max_members": 500,
+            "description": "A test guild",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    let guild = http.get_guild("G-001").await.expect("get ok");
+    assert_eq!(guild.id, "G-001");
+    assert_eq!(guild.name, "My Guild");
+    assert_eq!(guild.owner_id.as_deref(), Some("U-OWNER"));
+    assert_eq!(guild.member_count, Some(42));
+    server.verify().await;
+}
+
+/// **get_guild_members**：GET 带 limit + after 分页参数，响应解析为 `GuildMemberPage`。
+#[tokio::test]
+async fn get_guild_members_with_pagination() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/guilds/G-001/members"))
+        .and(query_param("limit", "50"))
+        .and(query_param("after", "cursor-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [
+                {
+                    "user": { "id": "U1", "username": "alice", "bot": false },
+                    "nick": "Alice",
+                    "roles": [],
+                    "joined_at": "2026-04-27T00:00:00+00:00"
+                },
+                {
+                    "user": { "id": "U2", "username": "bob", "bot": false },
+                    "nick": "Bob",
+                    "roles": ["admin"],
+                    "joined_at": "2026-05-01T00:00:00+00:00"
+                }
+            ],
+            "next": "cursor-2"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    let page = http
+        .get_guild_members("G-001", Some(50), Some("cursor-1"))
+        .await
+        .expect("list ok");
+    assert_eq!(page.data.len(), 2);
+    assert_eq!(page.data[0].user.username, "alice");
+    assert_eq!(page.data[1].nick.as_deref(), Some("Bob"));
+    assert_eq!(page.data[1].roles, vec!["admin"]);
+    assert_eq!(page.next.as_deref(), Some("cursor-2"));
+    server.verify().await;
+}
+
+/// **delete_guild_member**：DELETE 路径带 add_blacklist 查询参数。
+#[tokio::test]
+async fn delete_guild_member_with_blacklist() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("DELETE"))
+        .and(path("/guilds/G-001/members/U-BAD"))
+        .and(query_param("add_blacklist", "true"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    http.delete_guild_member("G-001", "U-BAD", true, None)
+        .await
+        .expect("kick ok");
+    server.verify().await;
+}
+
+/// **get_channels**：GET 频道子频道列表。
+#[tokio::test]
+async fn get_channels_returns_list() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/guilds/G-001/channels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "id": "CH-1",
+                "guild_id": "G-001",
+                "name": "general",
+                "type": 0
+            },
+            {
+                "id": "CH-2",
+                "guild_id": "G-001",
+                "name": "voice",
+                "type": 2,
+                "parent_id": "CH-1"
+            }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    let channels = http.get_channels("G-001").await.expect("list ok");
+    assert_eq!(channels.len(), 2);
+    assert_eq!(channels[0].name, "general");
+    assert_eq!(channels[0].type_, 0);
+    assert_eq!(channels[1].parent_id.as_deref(), Some("CH-1"));
+    server.verify().await;
+}
+
+/// **create_channel**：POST 创建子频道，body 含 name + type。
+#[tokio::test]
+async fn create_channel_posts_with_type() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/guilds/G-001/channels"))
+        .and(body_json(json!({
+            "name": "new-channel",
+            "type": 0
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "CH-NEW",
+            "guild_id": "G-001",
+            "name": "new-channel",
+            "type": 0
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    let channel = http
+        .create_channel("G-001", "new-channel", 0, None)
+        .await
+        .expect("create ok");
+    assert_eq!(channel.id, "CH-NEW");
+    assert_eq!(channel.name, "new-channel");
+    server.verify().await;
+}
+
+/// **patch_channel**：PATCH 更新子频道名称。
+#[tokio::test]
+async fn patch_channel_hits_patch_verb() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("PATCH"))
+        .and(path("/channels/CH-1"))
+        .and(body_json(json!({ "name": "renamed" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "CH-1",
+            "guild_id": "G-001",
+            "name": "renamed",
+            "type": 0
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    let channel = http
+        .patch_channel("CH-1", Some("renamed"), None, None)
+        .await
+        .expect("patch ok");
+    assert_eq!(channel.name, "renamed");
+    server.verify().await;
+}
+
+/// **delete_channel**：DELETE 子频道。
+#[tokio::test]
+async fn delete_channel_hits_path() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("DELETE"))
+        .and(path("/channels/CH-1"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    http.delete_channel("CH-1").await.expect("delete ok");
+    server.verify().await;
+}
+
+/// **delete_guild**：DELETE 解散频道。
+#[tokio::test]
+async fn delete_guild_hits_path() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("DELETE"))
+        .and(path("/guilds/G-001"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    http.delete_guild("G-001").await.expect("delete ok");
+    server.verify().await;
+}
+
+// ─── delete_guild_member with delete_history_days ───
+
+/// **踢出成员并删除历史消息**：`delete_history_days` 出现在查询串中。
+#[tokio::test]
+async fn delete_guild_member_with_history_days() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("DELETE"))
+        .and(path("/guilds/G-001/members/U-BAD"))
+        .and(query_param("add_blacklist", "false"))
+        .and(query_param("delete_history_days", "7"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    http.delete_guild_member("G-001", "U-BAD", false, Some(7))
+        .await
+        .expect("delete ok");
+    server.verify().await;
+}
+
+// ─── get_guild_member ───
+
+/// **获取单个成员**：`GET /guilds/{guild_id}/members/{user_id}` 返回 `GuildMemberEntry`。
+#[tokio::test]
+async fn get_guild_member_returns_entry() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/guilds/G-001/members/U-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "user": { "id": "U-1", "username": "alice", "bot": false },
+            "nick": "Alice",
+            "roles": ["admin"],
+            "joined_at": "2026-04-27T00:00:00+00:00"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    let member = http.get_guild_member("G-001", "U-1").await.expect("get ok");
+    assert_eq!(member.user.id, "U-1");
+    assert_eq!(member.nick.as_deref(), Some("Alice"));
+    assert_eq!(member.roles, vec!["admin"]);
+    server.verify().await;
+}
+
+// ─── Roles API tests ───
+
+/// **获取身份组列表**：`GET /guilds/{guild_id}/roles` → `RolePage`。
+#[tokio::test]
+async fn get_roles_returns_role_list() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/guilds/G-001/roles"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "roles": [
+                { "id": "R-1", "name": "Admin", "color": 3447003, "hoist": true, "member_count": 3, "member_limit": 10 },
+                { "id": "R-2", "name": "Member", "color": 0, "hoist": false, "member_count": 42, "member_limit": 100 }
+            ],
+            "role_num_limit": "5"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    let page = http.get_roles("G-001").await.expect("list ok");
+    assert_eq!(page.roles.len(), 2);
+    assert_eq!(page.roles[0].name, "Admin");
+    assert_eq!(page.roles[0].color, 3447003);
+    assert!(page.roles[0].hoist);
+    assert_eq!(page.roles[1].member_count, 42);
+    assert_eq!(page.role_num_limit.as_deref(), Some("5"));
+    server.verify().await;
+}
+
+/// **创建身份组**：`POST /guilds/{guild_id}/roles` 带 body，返回 `Role`。
+#[tokio::test]
+async fn create_role_posts_with_body() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/guilds/G-001/roles"))
+        .and(body_json(json!({
+            "name": "Moderator",
+            "color": 16776960,
+            "hoist": true
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "R-NEW",
+            "name": "Moderator",
+            "color": 16776960,
+            "hoist": true,
+            "member_count": 0,
+            "member_limit": 50
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    let role = http
+        .create_role("G-001", "Moderator", Some(16776960), Some(true))
+        .await
+        .expect("create ok");
+    assert_eq!(role.id, "R-NEW");
+    assert_eq!(role.name, "Moderator");
+    assert_eq!(role.color, 16776960);
+    server.verify().await;
+}
+
+/// **更新身份组**：`PATCH /guilds/{guild_id}/roles/{role_id}`。
+#[tokio::test]
+async fn patch_role_updates_name() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("PATCH"))
+        .and(path("/guilds/G-001/roles/R-1"))
+        .and(body_json(json!({ "name": "Super Admin" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "R-1",
+            "name": "Super Admin",
+            "color": 3447003,
+            "hoist": true,
+            "member_count": 3,
+            "member_limit": 10
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    let role = http
+        .patch_role("G-001", "R-1", Some("Super Admin"), None, None)
+        .await
+        .expect("patch ok");
+    assert_eq!(role.name, "Super Admin");
+    server.verify().await;
+}
+
+/// **删除身份组**：`DELETE /guilds/{guild_id}/roles/{role_id}`。
+#[tokio::test]
+async fn delete_role_hits_path() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("DELETE"))
+        .and(path("/guilds/G-001/roles/R-1"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    http.delete_role("G-001", "R-1").await.expect("delete ok");
+    server.verify().await;
+}
+
+/// **添加成员身份组**：`PUT /guilds/{guild_id}/members/{user_id}/roles/{role_id}`。
+#[tokio::test]
+async fn put_member_role_hits_path() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("PUT"))
+        .and(path("/guilds/G-001/members/U-1/roles/R-1"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    http.put_member_role("G-001", "U-1", "R-1")
+        .await
+        .expect("put ok");
+    server.verify().await;
+}
+
+/// **移除成员身份组**：`DELETE /guilds/{guild_id}/members/{user_id}/roles/{role_id}`。
+#[tokio::test]
+async fn delete_member_role_hits_path() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("DELETE"))
+        .and(path("/guilds/G-001/members/U-1/roles/R-1"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    http.delete_member_role("G-001", "U-1", "R-1")
+        .await
+        .expect("delete ok");
+    server.verify().await;
+}
+
+// ─── Mutes API tests ───
+
+/// **全员禁言**：`PATCH /guilds/{guild_id}/mute` body 含 `mute_seconds`。
+#[tokio::test]
+async fn mute_guild_with_seconds() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("PATCH"))
+        .and(path("/guilds/G-001/mute"))
+        .and(body_json(json!({ "mute_seconds": "60" })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    http.mute_guild("G-001", None, Some("60"))
+        .await
+        .expect("mute ok");
+    server.verify().await;
+}
+
+/// **取消全员禁言**：`PATCH /guilds/{guild_id}/mute` body 含 `mute_end_timestamp: "0"`。
+#[tokio::test]
+async fn unmute_guild_sends_zero() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("PATCH"))
+        .and(path("/guilds/G-001/mute"))
+        .and(body_json(json!({ "mute_end_timestamp": "0" })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    http.unmute_guild("G-001").await.expect("unmute ok");
+    server.verify().await;
+}
+
+/// **禁言单个成员**：`PATCH /guilds/{guild_id}/members/{user_id}/mute` body 含 `mute_end_timestamp`。
+#[tokio::test]
+async fn mute_member_with_timestamp() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("PATCH"))
+        .and(path("/guilds/G-001/members/U-1/mute"))
+        .and(body_json(json!({ "mute_end_timestamp": "1750000000" })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    http.mute_member("G-001", "U-1", Some("1750000000"), None)
+        .await
+        .expect("mute ok");
+    server.verify().await;
+}
+
+/// **解除单个成员禁言**：`PATCH /guilds/{guild_id}/members/{user_id}/mute` body 含 `mute_end_timestamp: "0"`。
+#[tokio::test]
+async fn unmute_member_sends_zero() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("PATCH"))
+        .and(path("/guilds/G-001/members/U-1/mute"))
+        .and(body_json(json!({ "mute_end_timestamp": "0" })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    http.unmute_member("G-001", "U-1").await.expect("unmute ok");
+    server.verify().await;
+}
+
+// ─── Permissions API tests ───
+
+/// **获取角色子频道权限**：`GET /channels/{id}/permissions/role/{role_id}`。
+#[tokio::test]
+async fn get_channel_role_permissions_parses() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/channels/CH-1/permissions/role/R-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "channel_id": "CH-1",
+            "role_id": "R-1",
+            "permissions": "114"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    let perms = http
+        .get_channel_role_permissions("CH-1", "R-1")
+        .await
+        .expect("get ok");
+    assert_eq!(perms.channel_id.as_deref(), Some("CH-1"));
+    assert_eq!(perms.role_id.as_deref(), Some("R-1"));
+    assert_eq!(perms.permissions, "114");
+    server.verify().await;
+}
+
+/// **设置角色子频道权限**：`PUT /channels/{id}/permissions/role/{role_id}` body 含 add/remove。
+#[tokio::test]
+async fn put_channel_role_permissions_sends_add_remove() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("PUT"))
+        .and(path("/channels/CH-1/permissions/role/R-1"))
+        .and(body_json(json!({ "add": "1", "remove": "2" })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    http.put_channel_role_permissions("CH-1", "R-1", Some("1"), Some("2"))
+        .await
+        .expect("put ok");
+    server.verify().await;
+}
+
+/// **获取成员子频道权限**：`GET /channels/{id}/permissions/member/{user_id}`。
+#[tokio::test]
+async fn get_channel_member_permissions_parses() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/channels/CH-1/permissions/member/U-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "channel_id": "CH-1",
+            "user_id": "U-1",
+            "permissions": "114"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    let perms = http
+        .get_channel_member_permissions("CH-1", "U-1")
+        .await
+        .expect("get ok");
+    assert_eq!(perms.channel_id.as_deref(), Some("CH-1"));
+    assert_eq!(perms.user_id.as_deref(), Some("U-1"));
+    assert_eq!(perms.permissions, "114");
+    server.verify().await;
+}
+
+/// **设置成员子频道权限**：`PUT /channels/{id}/permissions/member/{user_id}`。
+#[tokio::test]
+async fn put_channel_member_permissions_sends_add_remove() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("PUT"))
+        .and(path("/channels/CH-1/permissions/member/U-1"))
+        .and(body_json(json!({ "add": "8" })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    http.put_channel_member_permissions("CH-1", "U-1", Some("8"), None)
+        .await
+        .expect("put ok");
+    server.verify().await;
+}
+
+/// **permissions 字段兼容数字**：`serde` 能将 `"permissions": 114` (数字) 转为 String。
+#[tokio::test]
+async fn channel_permissions_string_or_number() {
+    let raw = json!({
+        "channel_id": "CH-1",
+        "user_id": "U-1",
+        "permissions": 114
+    });
+    let p: ChannelPermissions = serde_json::from_value(raw).expect("deserialize");
+    assert_eq!(p.permissions, "114");
+}
+
+// ─── Voice members test ───
+
+/// **获取语音频道成员**：`GET /channels/{id}/voice/members`。
+#[tokio::test]
+async fn get_voice_members_returns_list() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/channels/CH-1/voice/members"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "uid": "UID-1",
+                "member": {
+                    "user": { "id": "U-1", "username": "alice", "bot": false },
+                    "nick": "Alice",
+                    "roles": [],
+                    "joined_at": "2026-04-27T00:00:00+00:00"
+                }
+            },
+            {
+                "uid": "UID-2",
+                "member": {
+                    "user": { "id": "U-2", "username": "bob", "bot": false },
+                    "roles": []
+                }
+            }
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    let members = http.get_voice_members("CH-1").await.expect("list ok");
+    assert_eq!(members.len(), 2);
+    assert_eq!(members[0].uid, "UID-1");
+    assert_eq!(members[0].member.user.username, "alice");
+    assert_eq!(members[1].uid, "UID-2");
+    server.verify().await;
+}
+
+// ─── Message query/edit tests ───
+
+/// **获取频道消息**：`GET /channels/{id}/messages/{msg_id}` → `ChannelMessage`。
+#[tokio::test]
+async fn get_channel_message_returns_message() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/channels/CH-1/messages/MID-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "MID-1",
+            "channel_id": "CH-1",
+            "guild_id": "G-001",
+            "content": "hello",
+            "author": { "id": "U-1", "username": "alice", "bot": false },
+            "timestamp": "2026-06-13T00:00:00+00:00",
+            "edited_timestamp": "2026-06-13T01:00:00+00:00"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    let msg = http
+        .get_channel_message("CH-1", "MID-1")
+        .await
+        .expect("get ok");
+    assert_eq!(msg.id, "MID-1");
+    assert_eq!(msg.content, "hello");
+    assert_eq!(msg.author.username, "alice");
+    assert_eq!(
+        msg.edited_timestamp.as_deref(),
+        Some("2026-06-13T01:00:00+00:00")
+    );
+    server.verify().await;
+}
+
+/// **编辑频道消息**：`PATCH /channels/{id}/messages/{msg_id}` → `ChannelMessage`。
+#[tokio::test]
+async fn patch_channel_message_updates_content() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("PATCH"))
+        .and(path("/channels/CH-1/messages/MID-1"))
+        .and(body_json(json!({ "content": "edited text" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "MID-1",
+            "channel_id": "CH-1",
+            "guild_id": "G-001",
+            "content": "edited text",
+            "author": { "id": "U-BOT", "username": "mybot", "bot": true },
+            "timestamp": "2026-06-13T00:00:00+00:00",
+            "edited_timestamp": "2026-06-13T01:30:00+00:00"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    let msg = http
+        .patch_channel_message("CH-1", "MID-1", Some("edited text"), None)
+        .await
+        .expect("patch ok");
+    assert_eq!(msg.content, "edited text");
+    assert!(msg.edited_timestamp.is_some());
+    server.verify().await;
+}
+
+// ─── API Permissions tests ───
+
+/// **获取 API 权限列表**：`GET /guilds/{guild_id}/api_permissions` → `ApiPermissionList`。
+#[tokio::test]
+async fn get_api_permissions_parses_list() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/guilds/G-001/api_permissions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "permissions": [
+                {
+                    "api": { "path": "/guilds/{guild_id}/members/{user_id}", "method": "GET" },
+                    "auth_status": 1
+                },
+                {
+                    "api": { "path": "/guilds/{guild_id}/members", "method": "GET" },
+                    "auth_status": 2
+                }
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    let list = http.get_api_permissions("G-001").await.expect("get ok");
+    assert_eq!(list.permissions.len(), 2);
+    assert_eq!(list.permissions[0].auth_status, 1);
+    assert_eq!(
+        list.permissions[0].api.path,
+        "/guilds/{guild_id}/members/{user_id}"
+    );
+    assert_eq!(list.permissions[1].auth_status, 2);
+    server.verify().await;
+}
+
+/// **申请 API 权限**：`POST /guilds/{guild_id}/api_permissions/demand`。
+#[tokio::test]
+async fn demand_api_permission_sends_body() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/guilds/G-001/api_permissions/demand"))
+        .and(body_json(json!({
+            "channel_id": "CH-1",
+            "api_identify": { "path": "/guilds/{guild_id}/members", "method": "GET" },
+            "desc": "need member list for welcome feature"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "task_id": "TASK-1",
+            "status": 1
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    let demand = http
+        .demand_api_permission(
+            "G-001",
+            "CH-1",
+            "/guilds/{guild_id}/members",
+            "GET",
+            "need member list for welcome feature",
+        )
+        .await
+        .expect("demand ok");
+    assert_eq!(demand.task_id, "TASK-1");
+    assert_eq!(demand.status, 1);
+    server.verify().await;
+}
+
+// ─── Batch mute tests ───
+
+/// **批量禁言**：`PATCH /guilds/{guild_id}/mute` body 含 `user_ids` 数组。
+#[tokio::test]
+async fn mute_multi_member_with_user_ids() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("PATCH"))
+        .and(path("/guilds/G-001/mute"))
+        .and(body_json(json!({
+            "user_ids": ["U-1", "U-2"],
+            "mute_seconds": "120"
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    http.mute_multi_member("G-001", &["U-1", "U-2"], None, Some("120"))
+        .await
+        .expect("multi mute ok");
+    server.verify().await;
+}
+
+/// **批量解除禁言**：`PATCH /guilds/{guild_id}/mute` body 含 `user_ids` + `mute_end_timestamp: "0"`。
+#[tokio::test]
+async fn unmute_multi_member_sends_zero() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("PATCH"))
+        .and(path("/guilds/G-001/mute"))
+        .and(body_json(json!({
+            "user_ids": ["U-1", "U-2"],
+            "mute_end_timestamp": "0"
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    http.unmute_multi_member("G-001", &["U-1", "U-2"])
+        .await
+        .expect("multi unmute ok");
+    server.verify().await;
+}
+
+// ─── Role members test ───
+
+/// **获取角色成员列表**：`GET /guilds/{guild_id}/roles/{role_id}/members` 分页返回。
+#[tokio::test]
+async fn get_role_members_returns_page() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/guilds/G-001/roles/R-1/members"))
+        .and(query_param("start_index", "cursor-1"))
+        .and(query_param("limit", "50"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [
+                {
+                    "user": { "id": "U-1", "username": "alice", "bot": false },
+                    "nick": "Alice",
+                    "roles": ["R-1"],
+                    "joined_at": "2026-04-27T00:00:00+00:00"
+                },
+                {
+                    "user": { "id": "U-2", "username": "bob", "bot": false },
+                    "nick": "Bob",
+                    "roles": ["R-1"],
+                    "joined_at": "2026-05-01T00:00:00+00:00"
+                }
+            ],
+            "next": "cursor-2"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    let page = http
+        .get_role_members("G-001", "R-1", Some("cursor-1"), Some(50))
+        .await
+        .expect("get ok");
+    assert_eq!(page.data.len(), 2);
+    assert_eq!(page.data[0].user.username, "alice");
+    assert_eq!(page.data[0].roles, vec!["R-1"]);
+    assert_eq!(page.next.as_deref(), Some("cursor-2"));
+    server.verify().await;
+}
+
+// ─── Patch guild test ───
+
+/// **更新频道信息**：`PATCH /guilds/{guild_id}` body 含 name/description/icon。
+#[tokio::test]
+async fn patch_guild_updates_name() {
+    let server = MockServer::start().await;
+    mount_happy_token(&server).await;
+    Mock::given(method("PATCH"))
+        .and(path("/guilds/G-001"))
+        .and(body_json(json!({ "name": "New Guild Name" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "G-001",
+            "name": "New Guild Name",
+            "owner_id": "U-OWNER",
+            "description": "updated",
+            "member_count": 42,
+            "max_members": 500
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let http = make_client_against(&server).await;
+
+    let guild = http
+        .patch_guild("G-001", Some("New Guild Name"), None, None)
+        .await
+        .expect("patch ok");
+    assert_eq!(guild.name, "New Guild Name");
+    assert_eq!(guild.id, "G-001");
+    server.verify().await;
 }

@@ -37,6 +37,11 @@ pub struct ChannelMessage {
 
     /// ISO 8601。
     pub timestamp: String,
+
+    /// 消息编辑时间（ISO 8601）。仅 `GET /channels/{id}/messages/{mid}` 与
+    /// `PATCH` 后回带；Gateway 事件不携带。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edited_timestamp: Option<String>,
 }
 
 /// 群里 @ 机器人的消息——无 `channel_id` / `guild_id`，用 `group_openid` +

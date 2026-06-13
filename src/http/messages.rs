@@ -6,11 +6,12 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Serialize;
+use tracing::{debug, info};
 
 use crate::error::HttpError;
 use crate::http::Bot;
-use crate::types::message::{OutgoingChannelMessage, OutgoingMessage, SentMessage};
-use crate::types::payloads::{FileType, Media};
+use crate::types::message::{ChannelMessage, OutgoingChannelMessage, OutgoingMessage, SentMessage};
+use crate::types::payloads::{FileType, MarkdownPayload, Media};
 
 /// 富媒体上传请求体——`url` 与 `file_data` 互斥，二选一。
 ///
@@ -46,6 +47,8 @@ impl Bot {
     ) -> Result<SentMessage, HttpError> {
         let path = format!("/v2/groups/{group_openid}/messages");
         let prepared = self.with_default_msg_seq(msg);
+        info!(%group_openid, "[发送群消息]");
+        debug!(msg_type = ?prepared.msg_type(), content_len = prepared.content_length(), "[消息内容]");
         self.post_json(&path, &prepared).await
     }
 
@@ -59,6 +62,8 @@ impl Bot {
     ) -> Result<SentMessage, HttpError> {
         let path = format!("/v2/users/{openid}/messages");
         let prepared = self.with_default_msg_seq(msg);
+        info!(%openid, "[发送私聊消息]");
+        debug!(msg_type = ?prepared.msg_type(), content_len = prepared.content_length(), "[消息内容]");
         self.post_json(&path, &prepared).await
     }
 
@@ -77,6 +82,8 @@ impl Bot {
         msg: &OutgoingChannelMessage,
     ) -> Result<SentMessage, HttpError> {
         let path = format!("/channels/{channel_id}/messages");
+        info!(%channel_id, "[发送频道消息]");
+        debug!(content_len = msg.content_length(), "[频道消息内容]");
         self.post_json(&path, msg).await
     }
 
@@ -90,6 +97,8 @@ impl Bot {
         msg: &OutgoingChannelMessage,
     ) -> Result<SentMessage, HttpError> {
         let path = format!("/dms/{guild_id}/messages");
+        info!(%guild_id, "[发送频道私信]");
+        debug!(content_len = msg.content_length(), "[DM消息内容]");
         self.post_json(&path, msg).await
     }
 
@@ -222,4 +231,196 @@ impl Bot {
         };
         self.post_json(&path, &body).await
     }
+
+    /// 流式发送群消息（markdown）。按行切分，逐块发送，最后终结。
+    /// `max_chars_per_chunk` 控制每块最大字符数，默认 50。
+    pub async fn post_group_message_streaming(
+        &self,
+        group_openid: &str,
+        markdown_content: &str,
+        max_chars_per_chunk: Option<usize>,
+    ) -> Result<SentMessage, HttpError> {
+        use crate::types::message::StreamState;
+        use crate::types::payloads::MarkdownPayload;
+
+        let max_chars = max_chars_per_chunk.unwrap_or(50);
+        let chunks = split_by_lines(markdown_content, max_chars);
+        let total = chunks.len();
+
+        let mut stream_id: Option<String> = None;
+        let mut msg_seq = self.next_msg_seq();
+
+        // 逐块发送（state=1，生成中）
+        for (i, chunk) in chunks.iter().enumerate() {
+            let msg = OutgoingMessage::markdown(MarkdownPayload::raw(chunk.clone()))
+                .reply_seq(msg_seq)
+                .with_stream(StreamState {
+                    state: 1,
+                    id: stream_id.clone(),
+                    index: i as u32,
+                    reset: false,
+                });
+
+            let path = format!("/v2/groups/{group_openid}/messages");
+            let result: SentMessage = self.post_json(&path, &msg).await?;
+            stream_id = Some(result.id.clone());
+            msg_seq = self.next_msg_seq();
+
+            info!(
+                "[流式群消息] 群: {}, 进度: {}/{}",
+                group_openid,
+                i + 1,
+                total
+            );
+        }
+
+        // 发送终结消息（state=10，reset=true，全量文本）
+        let final_msg =
+            OutgoingMessage::markdown(MarkdownPayload::raw(markdown_content.to_string()))
+                .reply_seq(msg_seq)
+                .with_stream(StreamState {
+                    state: 10,
+                    id: stream_id,
+                    index: 1,
+                    reset: true,
+                });
+
+        let path = format!("/v2/groups/{group_openid}/messages");
+        let final_result: SentMessage = self.post_json(&path, &final_msg).await?;
+
+        info!(
+            "[流式群消息完成] 群: {}, 共 {} 块 + 1 终结",
+            group_openid, total
+        );
+
+        Ok(final_result)
+    }
+
+    /// 流式发送私聊消息（markdown）。语义同 [`Self::post_group_message_streaming`]。
+    pub async fn post_c2c_message_streaming(
+        &self,
+        openid: &str,
+        markdown_content: &str,
+        max_chars_per_chunk: Option<usize>,
+    ) -> Result<SentMessage, HttpError> {
+        use crate::types::message::StreamState;
+        use crate::types::payloads::MarkdownPayload;
+
+        let max_chars = max_chars_per_chunk.unwrap_or(50);
+        let chunks = split_by_lines(markdown_content, max_chars);
+        let total = chunks.len();
+
+        let mut stream_id: Option<String> = None;
+        let mut msg_seq = self.next_msg_seq();
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            let msg = OutgoingMessage::markdown(MarkdownPayload::raw(chunk.clone()))
+                .reply_seq(msg_seq)
+                .with_stream(StreamState {
+                    state: 1,
+                    id: stream_id.clone(),
+                    index: i as u32,
+                    reset: false,
+                });
+
+            let path = format!("/v2/users/{openid}/messages");
+            let result: SentMessage = self.post_json(&path, &msg).await?;
+            stream_id = Some(result.id.clone());
+            msg_seq = self.next_msg_seq();
+
+            info!("[流式私聊消息] 用户: {}, 进度: {}/{}", openid, i + 1, total);
+        }
+
+        let final_msg =
+            OutgoingMessage::markdown(MarkdownPayload::raw(markdown_content.to_string()))
+                .reply_seq(msg_seq)
+                .with_stream(StreamState {
+                    state: 10,
+                    id: stream_id,
+                    index: 1,
+                    reset: true,
+                });
+
+        let path = format!("/v2/users/{openid}/messages");
+        let final_result: SentMessage = self.post_json(&path, &final_msg).await?;
+
+        info!(
+            "[流式私聊消息完成] 用户: {}, 共 {} 块 + 1 终结",
+            openid, total
+        );
+
+        Ok(final_result)
+    }
+
+    /// `GET /channels/{channel_id}/messages/{message_id}` —— 获取指定频道消息。
+    pub async fn get_channel_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+    ) -> Result<ChannelMessage, HttpError> {
+        let path = format!("/channels/{channel_id}/messages/{message_id}");
+        info!(%channel_id, %message_id, "[获取频道消息]");
+        self.get_json(&path).await
+    }
+
+    /// `PATCH /channels/{channel_id}/messages/{message_id}` —— 编辑频道消息。
+    ///
+    /// 仅已开通编辑消息权限的机器人可用；`content` 与 `markdown` 至少传一个。
+    pub async fn patch_channel_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        content: Option<&str>,
+        markdown: Option<&MarkdownPayload>,
+    ) -> Result<ChannelMessage, HttpError> {
+        #[derive(Debug, Serialize)]
+        struct PatchChannelMessageRequest<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            content: Option<&'a str>,
+
+            #[serde(skip_serializing_if = "Option::is_none")]
+            markdown: Option<&'a MarkdownPayload>,
+        }
+
+        let path = format!("/channels/{channel_id}/messages/{message_id}");
+        let body = PatchChannelMessageRequest { content, markdown };
+        info!(%channel_id, %message_id, "[编辑频道消息]");
+        self.patch_json(&path, &body).await
+    }
+}
+
+/// 按行切分文本，保证每个分片以 `\n` 结尾。
+fn split_by_lines(text: &str, max_chars: usize) -> Vec<String> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+
+    for (i, line) in lines.iter().enumerate() {
+        let piece = if i < lines.len() - 1 {
+            format!("{}\n", line)
+        } else {
+            line.to_string()
+        };
+
+        if current.len() + piece.len() <= max_chars {
+            current.push_str(&piece);
+        } else {
+            if !current.is_empty() {
+                if !current.ends_with('\n') {
+                    current.push('\n');
+                }
+                chunks.push(current);
+            }
+            current = piece;
+        }
+    }
+
+    if !current.is_empty() {
+        if !current.ends_with('\n') {
+            current.push('\n');
+        }
+        chunks.push(current);
+    }
+
+    chunks
 }

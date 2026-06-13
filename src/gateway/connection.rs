@@ -277,6 +277,7 @@ async fn run_session_loop(
             msg = session.stream.next() => match msg {
                 Some(Ok(Message::Text(text))) => {
                     let payload: Payload = serde_json::from_str(text.as_str())?;
+                    debug!(op = ?payload.op, t = ?payload.t, raw = ?payload.d, "ws payload received");
                     if let Some(s) = payload.s {
                         ctx.last_seq = s;
                     }

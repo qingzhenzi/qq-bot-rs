@@ -8,7 +8,9 @@ pub use crate::client::Client;
 pub use crate::error::{AuthError, BotError, ClientBuildError, GatewayError, HttpError};
 pub use crate::event::{Event, EventHandler};
 pub use crate::gateway::{DispatchEvent, Gateway};
-pub use crate::http::Bot;
+pub use crate::http::{
+    ApiPermissionDemand, Bot, ChannelPermissions, InteractionCallbackCode, Role, RolePage,
+};
 pub use crate::intents::Intents;
 pub use crate::types::message::{
     C2cMessage, ChannelMessage, GroupMessage, OutgoingChannelMessage, OutgoingMessage, SentMessage,

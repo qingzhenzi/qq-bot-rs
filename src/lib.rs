@@ -15,5 +15,11 @@ pub use client::{Client, ClientBuilder};
 pub use error::{AuthError, BotError, ClientBuildError, GatewayError, HttpError};
 pub use event::{Event, EventHandler, dispatch_to};
 pub use gateway::{DispatchEvent, Gateway};
-pub use http::{Bot, BotBuilder, DmSession, EmojiType, InteractionCallbackCode, ReactionUsersPage};
+pub use http::{
+    Announce, ApiIdentify, ApiPermissionDemand, ApiPermissionEntry, ApiPermissionList, Bot,
+    BotBuilder, ChannelPermissions, DmSession, EmojiType, ForumPost, ForumThread,
+    InteractionCallbackCode, PinMessage, ReactionUsersPage, Role, RoleMemberPage, RolePage,
+    Schedule, VoiceMember,
+};
 pub use intents::Intents;
+pub use types::member::{GuildMemberEntry, GuildMemberPage};

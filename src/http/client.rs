@@ -5,13 +5,14 @@ use std::time::{Duration, Instant};
 
 use reqwest::Client as ReqwestClient;
 use reqwest::Response;
+use reqwest::StatusCode;
 use reqwest::header::AUTHORIZATION;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::json;
 use tokio::sync::Mutex;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::auth::Credentials;
 use crate::error::{AuthError, HttpError};
@@ -108,10 +109,11 @@ impl Bot {
         let url = format!("{}{path}", self.inner.api_base);
         debug!(method = "GET", %url, "request");
         let req = self.inner.http.get(&url);
-        let resp = self.send_authed(req).await?;
+        let resp = self.send_idempotent_with_retry("GET", &url, req).await?;
         decode_response(resp).await
     }
 
+    /// POST 不走 429 自动重试——非幂等，重复提交可能造成副作用。
     pub(super) async fn post_json<B, T>(&self, path: &str, body: &B) -> Result<T, HttpError>
     where
         B: Serialize + ?Sized,
@@ -128,11 +130,12 @@ impl Bot {
         let url = format!("{}{path}", self.inner.api_base);
         debug!(method = "DELETE", %url, "request");
         let req = self.inner.http.delete(&url);
-        let resp = self.send_authed(req).await?;
+        let resp = self.send_idempotent_with_retry("DELETE", &url, req).await?;
+        let trace_id = Self::extract_trace_id(&resp);
         let status = resp.status();
         let body = resp.text().await?;
         if !status.is_success() {
-            return Err(decode_error_body(status.as_u16(), body));
+            return Err(decode_error_body(status.as_u16(), body, trace_id));
         }
         Ok(())
     }
@@ -141,11 +144,12 @@ impl Bot {
         let url = format!("{}{path}", self.inner.api_base);
         debug!(method = "PUT", %url, "request");
         let req = self.inner.http.put(&url);
-        let resp = self.send_authed(req).await?;
+        let resp = self.send_idempotent_with_retry("PUT", &url, req).await?;
+        let trace_id = Self::extract_trace_id(&resp);
         let status = resp.status();
         let body = resp.text().await?;
         if !status.is_success() {
-            return Err(decode_error_body(status.as_u16(), body));
+            return Err(decode_error_body(status.as_u16(), body, trace_id));
         }
         Ok(())
     }
@@ -157,13 +161,43 @@ impl Bot {
         let url = format!("{}{path}", self.inner.api_base);
         debug!(method = "PUT", %url, "request");
         let req = self.inner.http.put(&url).json(body);
-        let resp = self.send_authed(req).await?;
+        let resp = self.send_idempotent_with_retry("PUT", &url, req).await?;
+        let trace_id = Self::extract_trace_id(&resp);
         let status = resp.status();
         let body = resp.text().await?;
         if !status.is_success() {
-            return Err(decode_error_body(status.as_u16(), body));
+            return Err(decode_error_body(status.as_u16(), body, trace_id));
         }
         Ok(())
+    }
+
+    pub(super) async fn patch_json_empty<B>(&self, path: &str, body: &B) -> Result<(), HttpError>
+    where
+        B: Serialize + ?Sized,
+    {
+        let url = format!("{}{path}", self.inner.api_base);
+        debug!(method = "PATCH", %url, "request");
+        let req = self.inner.http.patch(&url).json(body);
+        let resp = self.send_idempotent_with_retry("PATCH", &url, req).await?;
+        let trace_id = Self::extract_trace_id(&resp);
+        let status = resp.status();
+        let body = resp.text().await?;
+        if !status.is_success() {
+            return Err(decode_error_body(status.as_u16(), body, trace_id));
+        }
+        Ok(())
+    }
+
+    pub(super) async fn patch_json<B, T>(&self, path: &str, body: &B) -> Result<T, HttpError>
+    where
+        B: Serialize + ?Sized,
+        T: DeserializeOwned,
+    {
+        let url = format!("{}{path}", self.inner.api_base);
+        debug!(method = "PATCH", %url, "request");
+        let req = self.inner.http.patch(&url).json(body);
+        let resp = self.send_idempotent_with_retry("PATCH", &url, req).await?;
+        decode_response(resp).await
     }
 
     async fn send_authed(&self, req: reqwest::RequestBuilder) -> Result<Response, HttpError> {
@@ -174,6 +208,51 @@ impl Bot {
             .send()
             .await?;
         Ok(resp)
+    }
+
+    /// 幂等请求（GET/PUT/DELETE/PATCH）走一次 429 自动退避重试。
+    ///
+    /// 首次 429 读 `Retry-After`（默认 5s）sleep 后重试一次；
+    /// 第二次仍 429 则透出 `ApiError`。非 429 错不重试。
+    async fn send_idempotent_with_retry(
+        &self,
+        method: &str,
+        url: &str,
+        req: reqwest::RequestBuilder,
+    ) -> Result<Response, HttpError> {
+        // try_clone 仅在 body 为 stream 时失败——本库只用 .json()，总是可 clone。
+        let retry_req = req.try_clone().expect("request should be cloneable");
+        let resp = self.send_authed(req).await?;
+
+        if resp.status() != StatusCode::TOO_MANY_REQUESTS {
+            return Ok(resp);
+        }
+
+        let retry_secs = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(5);
+
+        // 丢弃 429 的响应体——重试时会重新发。
+        warn!(
+            method,
+            %url,
+            retry_secs,
+            "HTTP 429 — retrying after {retry_secs}s"
+        );
+        tokio::time::sleep(Duration::from_secs(retry_secs.min(15))).await;
+
+        self.send_authed(retry_req).await
+    }
+
+    /// 从响应头提取 `X-Tps-Trace-Id`。
+    fn extract_trace_id(resp: &Response) -> Option<String> {
+        resp.headers()
+            .get("X-Tps-Trace-Id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
     }
 }
 
@@ -209,10 +288,11 @@ impl Inner {
             }))
             .send()
             .await?;
+        let trace_id = Bot::extract_trace_id(&resp);
         let status = resp.status();
         let body = resp.text().await?;
         if !status.is_success() {
-            return Err(decode_error_body(status.as_u16(), body));
+            return Err(decode_error_body(status.as_u16(), body, trace_id));
         }
         // QQ 在凭证错时也回 200——把"200 + 没有 access_token"映射为鉴权拒绝，
         // 文案比 schema 错友好。
@@ -237,16 +317,18 @@ impl Inner {
 }
 
 async fn decode_response<T: DeserializeOwned>(resp: Response) -> Result<T, HttpError> {
+    let trace_id = Bot::extract_trace_id(&resp);
     let status = resp.status();
     let body = resp.text().await?;
     if !status.is_success() {
-        return Err(decode_error_body(status.as_u16(), body));
+        return Err(decode_error_body(status.as_u16(), body, trace_id));
     }
     serde_json::from_str(&body).map_err(|source| HttpError::Decode { body, source })
 }
 
 // 非 2xx 响应若是 `{code, message, ...}` 形态升级为 ApiError，否则裸 body 走 Status。
-fn decode_error_body(status: u16, body: String) -> HttpError {
+// `header_trace_id` 来自响应头 `X-Tps-Trace-Id`，优先于 body 中的 `trace_id`。
+fn decode_error_body(status: u16, body: String, header_trace_id: Option<String>) -> HttpError {
     if let Ok(v) = serde_json::from_str::<Value>(&body)
         && let Some(code) = v.get("code").and_then(Value::as_i64)
     {
@@ -255,7 +337,9 @@ fn decode_error_body(status: u16, body: String) -> HttpError {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned();
-        let trace_id = v.get("trace_id").and_then(Value::as_str).map(str::to_owned);
+        // 优先用响应头 trace_id（经网关注入的更可靠），body 中的用作 fallback。
+        let trace_id = header_trace_id
+            .or_else(|| v.get("trace_id").and_then(Value::as_str).map(str::to_owned));
         return HttpError::ApiError {
             status,
             code,

@@ -4,6 +4,24 @@ use serde_repr::{Deserialize_repr, Serialize_repr};
 use super::inbound::MessageReference;
 use crate::types::payloads::{ArkPayload, EmbedPayload, KeyboardPayload, MarkdownPayload, Media};
 
+/// 流式消息状态
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamState {
+    /// 1 = 生成中, 10 = 结束
+    pub state: u8,
+
+    /// 流式消息 ID，首条为 None，后续用返回的 id
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+
+    /// 分片索引，从 0 开始递增
+    pub index: u32,
+
+    /// 是否重新生成（终结消息时为 true）
+    #[serde(default)]
+    pub reset: bool,
+}
+
 /// v2（群 / c2c）发送时必填的 `msg_type`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
 #[repr(u8)]
@@ -76,6 +94,9 @@ pub struct OutgoingMessage {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     media: Option<Media>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<StreamState>,
 }
 
 impl OutgoingMessage {
@@ -91,6 +112,7 @@ impl OutgoingMessage {
             ark: None,
             embed: None,
             media: None,
+            stream: None,
         }
     }
 
@@ -165,6 +187,27 @@ impl OutgoingMessage {
     /// 补一段文本——markdown / media 主体为主时偶尔需要附带说明。
     pub fn with_content(mut self, content: impl Into<String>) -> Self {
         self.content = Some(content.into());
+        self
+    }
+
+    /// 获取文本内容（如果主体是文本）。
+    pub fn content(&self) -> Option<&str> {
+        self.content.as_deref()
+    }
+
+    /// 消息类型（text / markdown / ark / embed / media 等）。
+    pub fn msg_type(&self) -> MessageType {
+        self.msg_type
+    }
+
+    /// 纯文本内容的字节长度——非文本主体返回 0。
+    pub fn content_length(&self) -> usize {
+        self.content.as_deref().map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// 设置流式状态——用于流式 markdown 发送。
+    pub fn with_stream(mut self, stream: StreamState) -> Self {
+        self.stream = Some(stream);
         self
     }
 }
@@ -266,6 +309,16 @@ impl OutgoingChannelMessage {
     pub fn with_content(mut self, content: impl Into<String>) -> Self {
         self.content = Some(content.into());
         self
+    }
+
+    /// 获取文本内容（如果主体是文本）。
+    pub fn content(&self) -> Option<&str> {
+        self.content.as_deref()
+    }
+
+    /// 纯文本内容的字节长度——非文本主体返回 0。
+    pub fn content_length(&self) -> usize {
+        self.content.as_deref().map(|s| s.len()).unwrap_or(0)
     }
 }
 
