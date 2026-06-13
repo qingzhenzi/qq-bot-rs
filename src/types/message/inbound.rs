@@ -74,6 +74,9 @@ pub struct GroupMessage {
 pub struct GroupMessageAuthor {
     /// 群成员 openid——同一用户在不同群间不同。
     pub member_openid: String,
+    /// QQ 昵称（部分事件可能为空）
+    #[serde(default)]
+    pub username: String,
 }
 
 /// 用户私聊（C2C）消息。
