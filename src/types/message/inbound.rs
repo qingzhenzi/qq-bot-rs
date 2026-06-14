@@ -120,6 +120,10 @@ pub struct Attachment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
 
+    /// 语音消息的自动语音识别（ASR）转文字结果
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asr_refer_text: Option<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height: Option<u32>,
 

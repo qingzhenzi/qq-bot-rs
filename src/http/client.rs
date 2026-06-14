@@ -34,6 +34,65 @@ const DEFAULT_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARG
 // access_token 有效期约 7200s，留 60s 余量避免请求恰好命中失效边界。
 const REFRESH_LEAD: Duration = Duration::from_secs(60);
 
+// ── 速率限制（Token Bucket）──
+
+const DEFAULT_RATE_CAPACITY: u32 = 5;
+const DEFAULT_RATE_REFILL: f64 = 5.0;
+
+/// Token Bucket 速率限制器——在发包前主动等待，避免触发 QQ API 429。
+#[derive(Clone)]
+pub(crate) struct RateLimiter {
+    capacity: f64,
+    refill_per_sec: f64,
+    state: Arc<Mutex<RateState>>,
+}
+
+struct RateState {
+    available: f64,
+    last_refill: Instant,
+}
+
+impl RateLimiter {
+    pub fn new(capacity: u32, refill_per_sec: f64) -> Self {
+        Self {
+            capacity: capacity as f64,
+            refill_per_sec,
+            state: Arc::new(Mutex::new(RateState {
+                available: capacity as f64,
+                last_refill: Instant::now(),
+            })),
+        }
+    }
+
+    /// 消耗一个 token，如果没有则等待补充到足够。
+    pub async fn acquire(&self) {
+        loop {
+            let wait = {
+                let mut s = self.state.lock().await;
+                let now = Instant::now();
+                let elapsed = now.saturating_duration_since(s.last_refill).as_secs_f64();
+                if elapsed > 0.0 {
+                    s.available = (s.available + elapsed * self.refill_per_sec).min(self.capacity);
+                    s.last_refill = now;
+                }
+                if s.available >= 1.0 {
+                    s.available -= 1.0;
+                    return; // 有 token，直接放行
+                }
+                // 还需要等多久才有 1 个 token
+                Duration::from_secs_f64((1.0 - s.available) / self.refill_per_sec)
+            };
+            tokio::time::sleep(wait).await;
+        }
+    }
+}
+
+impl Default for RateLimiter {
+    fn default() -> Self {
+        Self::new(DEFAULT_RATE_CAPACITY, DEFAULT_RATE_REFILL)
+    }
+}
+
 /// QQ 机器人句柄。
 #[derive(Clone)]
 pub struct Bot {
@@ -58,6 +117,9 @@ struct Inner {
     /// 必须各自序号唯一，否则第二条起回 40054005「消息被去重」。`Relaxed` 顺序
     /// 足够：我们只要值唯一，不要求跨线程"先后"语义。
     next_msg_seq: AtomicU32,
+
+    /// 速率限制器——发送前主动等待 token，避免触发 QQ API 429。
+    rate_limiter: RateLimiter,
 }
 
 struct TokenState {
@@ -201,6 +263,7 @@ impl Bot {
     }
 
     async fn send_authed(&self, req: reqwest::RequestBuilder) -> Result<Response, HttpError> {
+        self.inner.rate_limiter.acquire().await;
         let token = self.inner.ensure_token().await?;
         let resp = req
             .header(AUTHORIZATION, format!("QQBot {token}"))
@@ -358,6 +421,8 @@ pub struct BotBuilder {
     user_agent: String,
     api_base_override: Option<String>,
     token_endpoint_override: Option<String>,
+    rate_capacity: Option<u32>,
+    rate_refill: Option<f64>,
 }
 
 impl Default for BotBuilder {
@@ -368,6 +433,8 @@ impl Default for BotBuilder {
             user_agent: DEFAULT_USER_AGENT.to_owned(),
             api_base_override: None,
             token_endpoint_override: None,
+            rate_capacity: None,
+            rate_refill: None,
         }
     }
 }
@@ -400,6 +467,14 @@ impl BotBuilder {
         self
     }
 
+    /// 配置速率限制。`capacity` = 桶容量（最大突发请求数），`refill_per_sec` = 每秒补充数。
+    /// 默认 5 容量、5/秒 补充。
+    pub fn rate_limit(mut self, capacity: u32, refill_per_sec: f64) -> Self {
+        self.rate_capacity = Some(capacity);
+        self.rate_refill = Some(refill_per_sec);
+        self
+    }
+
     pub fn build(self, credentials: Credentials) -> Bot {
         let api_base = self.api_base_override.unwrap_or_else(|| {
             if self.is_sandbox {
@@ -411,6 +486,10 @@ impl BotBuilder {
         let token_endpoint = self
             .token_endpoint_override
             .unwrap_or_else(|| TOKEN_EXCHANGE_URL.to_owned());
+        let rate_limiter = match (self.rate_capacity, self.rate_refill) {
+            (Some(cap), Some(refill)) => RateLimiter::new(cap, refill),
+            _ => RateLimiter::default(),
+        };
         let http = ReqwestClient::builder()
             .timeout(self.timeout)
             .user_agent(self.user_agent)
@@ -426,6 +505,7 @@ impl BotBuilder {
                 token: Mutex::new(TokenState::default()),
                 refresh: Mutex::new(()),
                 next_msg_seq: AtomicU32::new(1),
+                rate_limiter,
             }),
         }
     }

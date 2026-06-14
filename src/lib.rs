@@ -7,6 +7,7 @@ pub mod event;
 pub mod gateway;
 pub mod http;
 pub mod intents;
+pub mod pool;
 pub mod prelude;
 pub mod types;
 
@@ -22,4 +23,5 @@ pub use http::{
     Schedule, VoiceMember,
 };
 pub use intents::Intents;
+pub use pool::BotPool;
 pub use types::member::{GuildMemberEntry, GuildMemberPage};

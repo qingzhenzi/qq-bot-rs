@@ -36,6 +36,21 @@ impl Credentials {
         Self::from_env_vars(ENV_APP_ID, ENV_APP_SECRET)
     }
 
+    /// 从指定前缀的环境变量加载：`{PREFIX}_APP_ID` / `{PREFIX}_APP_SECRET`。
+    /// 例如 `prefix = "QQ_BOT_0"` → `QQ_BOT_0_APP_ID` / `QQ_BOT_0_APP_SECRET`。
+    pub fn from_env_with_prefix(prefix: &str) -> Result<Self, AuthError> {
+        let id_var = format!("{}_APP_ID", prefix);
+        let secret_var = format!("{}_APP_SECRET", prefix);
+        Self::from_env_vars(&id_var, &secret_var)
+    }
+
+    /// 从带序号的环境变量加载：`QQ_BOT_APP_ID_{index}` / `QQ_BOT_APP_SECRET_{index}`。
+    /// 常配合多账号配置使用，如 `Credentials::from_env_index(0)`。
+    pub fn from_env_index(index: usize) -> Result<Self, AuthError> {
+        let prefix = format!("QQ_BOT_{}", index);
+        Self::from_env_with_prefix(&prefix)
+    }
+
     fn from_env_vars(id_var: &str, secret_var: &str) -> Result<Self, AuthError> {
         let app_id = env::var(id_var).map_err(|_| AuthError::MissingEnv(id_var.to_owned()))?;
         let app_secret =
